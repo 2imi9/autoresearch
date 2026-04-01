@@ -1,91 +1,343 @@
-# autoresearch
+# AutoResearch — LocalPilot
 
-![teaser](progress.png)
+**An autonomous research agent that visually browses arXiv papers, reasons about what to try, and trains models — every experiment cites a paper, every improvement is explainable.**
+
+![teaser](figures/fig_teaser.png)
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+## Why LocalPilot?
 
-## How it works
+Most autoresearch systems use **random perturbation** — blindly tweak a number, train, keep if better. This works, but you learn nothing about *why* something worked, and every failed experiment is wasted compute with no insight.
 
-The repo is deliberately kept small and only really has three files that matter:
+LocalPilot is different: it has a **visual web browsing agent** ([MolmoWeb-4B](https://huggingface.co/allenai/MolmoWeb-4B-0225)) that reads real arXiv papers — not just titles or abstracts, but full figures, tables, and methods sections — then reasons about what to try next.
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+| | Random perturbation | LocalPilot |
+|---|---|---|
+| Browses papers | No | Yes — MolmoWeb visually reads full PDFs |
+| Searches literature | No | Yes — arXiv via visual browsing |
+| Proposals are explainable | No | Yes — every change cites a paper |
+| Learns from failures | No | Yes — LLM sees full history |
+| Scales to larger search spaces | Poorly | Naturally |
+| Runs fully local | Yes | Yes — no cloud APIs needed |
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+## What it does
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+```
+  You run it                                   It does this, autonomously
+  ─────────                                    ──────────────────────────
+  uv run python experiments/run_enhanced_v3.py ─>  1. Reads train.py + past results
+                                                 2. Qwen3.5-9B plans what to search
+                                                 3. MolmoWeb-4B browses arXiv visually
+                                                 4. Devstral-24B proposes a HP change, citing why
+                                                 5. Edits train.py, trains locally
+                                                 6. Keeps if val_bpb improves, reverts if not
+                                                 7. Loops — gets smarter each iteration
+```
+
+The key innovation is **step 3**: MolmoWeb-4B is a visual web agent that takes screenshots of web pages and interacts with them like a human would. It navigates to arXiv papers, scrolls through figures and tables, and extracts specific techniques — not just keyword matches from abstracts.
+
+All models run locally (Qwen3.5-9B for orchestration, MolmoWeb-4B for browsing, Devstral-24B for code). No API keys, no cloud bills.
+
+## Results
+
+### karpathy/autoresearch benchmark
+
+Starting from the karpathy baseline config (val_bpb ~1.268), LocalPilot found **11 paper-traceable improvements** reaching **1.1507 BPB** in 64 experiments:
+
+```
+Experiment #50: WINDOW_PATTERN "SL" → "L"
+  Reason: "Switching to full-context pattern mitigates instabilities in
+           small-scale proxies where limited context exacerbates noise"
+  Result: val_bpb 1.1510 → 1.1507 ✓ kept
+```
+
+### Surrogate benchmark validation (YAHPO LCBench)
+
+To validate with proper statistics, we ran both methods on [YAHPO Gym](https://github.com/slds-lmu/yahpo_gym) (LCBench: 7 HPs, neural net tuning, instant surrogate evaluations) with **500 seeds each**:
+
+![yahpo](figures/fig6_yahpo.png)
+
+| | Random search | Informed search |
+|---|---|---|
+| Median val_cross_entropy | 0.1485 | **0.1124** |
+| Improvement | — | **24% better** |
+| Seeds | 500 | 500 |
+
+With enough seeds and a larger search space, informed search clearly dominates random perturbation. The karpathy benchmark (13 bounded HPs) is deliberately constrained — see [Limitations](#limitations).
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Windows with NVIDIA GPU (24+ GB VRAM for default models, or 12+ GB with Q4 quants — see `localpilot.yaml`), Python 3.11+, [uv](https://docs.astral.sh/uv/), Git, CMake, CUDA toolkit, Docker (optional, for FA3 training)
+
+> **Note:** Currently tested on Windows. Linux/macOS support is planned — the main blockers are hardcoded `.exe` paths in the runner scripts.
+
+### Step 1: Clone and install
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
+git clone https://github.com/2imi9/autoresearch.git
+cd autoresearch
 uv sync
-
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+### Step 2: Download training data
 
-## Running the agent
-
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
-
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+```bash
+uv run python prepare.py
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+This downloads FineWeb-Edu shards and trains a BPE tokenizer (~2 min, cached in `~/.cache/autoresearch/`).
 
-## Project structure
+### Step 3: Build llama.cpp
+
+The research agent uses [llama.cpp](https://github.com/ggerganov/llama.cpp) to run local LLMs. Build it as a sibling directory:
+
+```bash
+cd ..
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+```
+
+After building, copy (or symlink) the server binary to the repo root:
+
+```bash
+# Windows (adjust path if your build config differs)
+copy build\bin\Release\llama-server.exe llama-server.exe
+
+# The runner expects it at: ../llama.cpp/llama-server.exe
+# (i.e., autoresearch/ and llama.cpp/ are sibling directories)
+```
+
+```bash
+cd ../autoresearch
+```
+
+### Step 4: Download GGUF models
+
+Create a `models/` directory next to `autoresearch/` and download these GGUF files:
+
+```bash
+# Create model directories (from autoresearch/ parent)
+cd ..
+mkdir -p models/qwen3.5-9b models/devstral
+
+# Qwen3.5-9B — code/orchestration agent (~6 GB)
+# Download from: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
+huggingface-cli download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q6_K.gguf --local-dir models/qwen3.5-9b
+
+# Devstral-24B — experiment proposal agent (~19 GB)
+# Download from: https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF
+huggingface-cli download unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF Devstral-Small-2-24B-Instruct-2512-Q6_K.gguf --local-dir models/devstral
+
+cd autoresearch
+```
+
+MolmoWeb-4B (the visual web agent) must also be pre-downloaded. Use `huggingface-cli download allenai/MolmoWeb-4B-0225 --local-dir models/MolmoWeb-4B` or download via HuggingFace transformers' `from_pretrained()` caching before running offline.
+
+**Expected directory layout after setup:**
+```
+parent/
+├── autoresearch/       # this repo
+├── llama.cpp/          # built with CUDA, llama-server.exe at root
+└── models/
+    ├── qwen3.5-9b/
+    │   └── Qwen3.5-9B-Q6_K.gguf
+    ├── devstral/
+    │   └── Devstral-Small-2-24B-Instruct-2512-Q6_K.gguf
+    └── MolmoWeb-4B/    # visual web agent (pre-download required)
+```
+
+### Step 5: Set up the Python environment
+
+The runner scripts expect a local `.venv` created by `uv`. If `uv sync` (Step 1) completed successfully, this is already done. Verify:
+
+```bash
+# Should print the Python path inside .venv
+python -c "import sys; print(sys.executable)"
+```
+
+> **Optional:** A Dockerfile is included for running training inside a Linux container (useful for Flash Attention 3 which requires Linux CUDA). Build with `docker build -t autoresearch-train .` if needed.
+
+### Step 6: Run it
+
+```bash
+# Run the autonomous research agent (reads papers, proposes experiments)
+uv run python experiments/run_enhanced_v3.py
+
+# Or run the random baseline for comparison (no LLMs needed)
+uv run python experiments/run_baseline_v2.py
+```
+
+The enhanced runner will pre-flight check that all models exist and print download commands if anything is missing.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `FileNotFoundError: llama-server.exe` | Copy the built binary to `../llama.cpp/llama-server.exe` (see Step 3) |
+| `FileNotFoundError: ...Q6_K.gguf` | Download the GGUF model files (see Step 4) |
+| `uv sync` fails on torch | Ensure CUDA toolkit is installed; `uv sync` pulls PyTorch with CUDA 13.0 |
+| Docker build fails (optional) | Ensure Docker Desktop has WSL2 backend + GPU access enabled |
+| Out of VRAM | Edit `localpilot.yaml` to select smaller model variants (Q4 instead of Q6) |
+
+## How the research pipeline works
+
+### V3 (current)
+
+Qwen3.5-9B orchestrates the loop — it decides what to search, MolmoWeb-4B browses arXiv visually, and Devstral-24B writes the code patch:
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+  Qwen3.5-9B orchestrator               Plans search direction from history
+         │
+         ▼
+  MolmoWeb-4B visual browser             Browses arXiv, takes screenshots,
+                                         reads figures/tables/methods
+         │
+         ▼
+  Devstral-24B code agent                Writes train.py patch citing papers
 ```
 
-## Design choices
+**Why visual browsing matters:** API-only approaches see titles and abstracts. MolmoWeb sees the actual paper — training curves, architecture diagrams, ablation tables. It can tell the difference between a paper that *mentions* learning rate scheduling and one that *demonstrates* a specific schedule that works for shallow transformers.
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+### V4 (WIP): tiered pipeline + agent-grade resilience
 
-## Platform support
+V4 adds Semantic Scholar + arXiv API search with batch relevance scoring, plus agent design patterns adapted from [Claude Code](https://docs.anthropic.com/en/docs/claude-code):
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+```
+  Semantic Scholar + arXiv API          Fast, free, ~50 papers/query
+         │
+         ▼
+  Qwen batch scoring (0-10)            One LLM call scores ALL papers
+         │
+    ┌────┼────┐
+    ▼    ▼    ▼
+  Skip  Summary  Deep-read             Only top papers get browsed
+  (<5)  (5-7)    (≥7)
+                   │
+                   ▼
+              MolmoWeb-4B               Takes screenshots, clicks through
+                                        figures/tables, extracts techniques
+         │
+         ▼
+  Qwen proposals (thinking mode)       /think enabled for high-quality reasoning
+         │
+         ▼
+  Validation → OOM check → Train       Stop hooks catch bad proposals early
+```
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
+**Patterns borrowed from Claude Code's agent framework:**
+- **Batch scoring** — all papers scored in one LLM call instead of N sequential calls (~60s faster)
+- **History compaction** — old experiments summarized into a structured digest (keeps, failure patterns, parameter coverage) so the LLM gets actionable context, not a raw log
+- **Adaptive thinking** — Qwen3.5's native `/think` mode enabled for proposal generation (the highest-stakes decision), disabled for fast scoring/planning
+- **Post-proposal validation** — stop hooks reject duplicates, recently-exhausted parameters, and OOM configs before wasting a training run
+- **Structured error recovery** — exponential backoff with jitter, error categorization (retryable vs terminal), and a circuit breaker that falls back to random proposals after 3 consecutive research failures
 
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
+This solves the rate-limiting problem — raw MolmoWeb browsing triggered CDN bans (~1500 HTTP requests per session). Tiered research cuts web requests by ~90%.
 
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+## Adapting to your own project
 
-## Notable forks
+LocalPilot isn't locked to karpathy's train.py. To use it on your own training script:
 
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
+1. Define your hyperparameters and bounds in `constants.py`
+2. Point the runner at your training script
+3. Define your evaluation metric (val_bpb, accuracy, loss, etc.)
+
+The LLM reads papers relevant to **your** task and proposes changes specific to **your** setup.
+
+## File structure
+
+```
+autoresearch/
+├── train.py                  # The file the agent edits
+├── prepare.py                # One-time data prep
+├── localpilot.yaml           # Model selection config
+├── Dockerfile                # CUDA 13.0 + FA3 training image (optional)
+│
+├── experiments/
+│   ├── run_baseline_v2.py    # Random perturbation (Condition A)
+│   ├── run_enhanced_v3.py    # Paper-grounded search (Condition B)
+│   ├── run_enhanced_v4.py    # V4 (WIP): open values + OOM pre-flight
+│   └── run_both.py           # Run both conditions back-to-back
+│
+├── localpilot/
+│   ├── browse.py             # MolmoWeb visual web agent
+│   ├── config.py             # Hardware-aware model selection
+│   ├── constants.py          # HP bounds and parameter definitions
+│   └── analyze.py            # Result analysis + figures
+│
+├── results/
+│   ├── results_baseline_v2.tsv    # Baseline experiment log (45 experiments)
+│   ├── results_enhanced_v3.tsv    # Enhanced experiment log (64 experiments)
+│   ├── proposals_baseline_v2.jsonl
+│   ├── proposals_enhanced_v3.jsonl
+│   ├── make_figures.py            # Generates all figures from result data
+│   └── analysis.ipynb             # Exploratory analysis notebook
+│
+├── figures/                  # Publication figures
+└── tests/                    # Unit + integration tests
+```
+
+## Models and VRAM
+
+All phases are sequential — models load/unload, never run simultaneously:
+
+| Phase | Model | VRAM |
+|---|---|---|
+| Research | MolmoWeb-4B or 8B | ~8–18 GB |
+| Orchestrate + Propose | Qwen3.5-9B + Devstral-24B | 8–25 GB |
+| Train | train.py (local or Docker) | ~6–12 GB |
+
+A single 24+ GB GPU handles the full pipeline with default Q6 models (or 12+ GB with Q4 quants). Override model selection via `localpilot.yaml` or environment variables.
+
+## Cost
+
+| | Per experiment | 64-experiment run |
+|---|---|---|
+| Local GPU (electricity) | ~$0.002 | **~$0.10** |
+| Cloud H100 ($2.49/hr) | ~$0.23 | ~$14.70 |
+
+**~150x cheaper** than cloud. Calculated at $0.13/kWh, RTX 5090 Laptop at 150W.
+
+## Limitations
+
+**Benchmark scope:** The karpathy benchmark (13 bounded HPs, 5-min training runs) is a single run (n=1). We don't yet have multi-seed variance measurements for the full agent pipeline, so we can't claim statistical significance on this benchmark alone.
+
+**YAHPO validation:** The surrogate benchmark (500 seeds, 24% improvement) validates that *informed search beats random search in principle* — but it uses a simulated informed strategy on a different task (LCBench), not our actual MolmoWeb + Qwen + Devstral pipeline. It's evidence for the approach, not a direct measurement of our system.
+
+**Paper citations:** The LLM generates references to justify its proposals (e.g., "[Smith2026]"). These citations reflect the LLM's training data, not verified literature lookups — though MolmoWeb does browse real papers during the search phase.
+
+The real value of paper-grounded search emerges with:
+
+- **Larger search spaces** — architecture choices, data mixing, training schedules
+- **Expensive training** — when each failed experiment costs hours, not minutes
+- **Structural changes** — new attention patterns, optimizer variants, positional embeddings
+
+We chose this constrained benchmark to validate the system end-to-end. More rigorous multi-seed evaluation and larger-scale benchmarks are future work.
+
+## Contributing / Future work
+
+Good first issues for contributors:
+
+- **Linux/macOS support** — remove hardcoded `.exe` paths in runner scripts (straightforward)
+- **More benchmarks** — try it on fine-tuning, RLHF, or vision models and share results
+
+Bigger research directions:
+
+- **Unbounded parameter search** — V4 allows free values (still clamped to safe bounds). Next step: let the LLM propose entirely new parameters or architectural changes beyond the predefined search space
+- **Multi-objective optimization** — optimize for speed + quality, not just val_bpb
+- **Smarter paper selection** — V4's tiered pipeline (Scholar + arXiv + relevance scoring) needs testing and tuning
+- **Multi-seed evaluation** — run more seeds on the karpathy benchmark to measure variance
+
+PRs welcome. If you try it on your own training setup, open an issue — we'd love to hear what works.
+
+## Based on
+
+- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — the original autonomous research framework
+- [MolmoWeb-4B](https://huggingface.co/allenai/MolmoWeb-4B-0225) — visual web agent for paper reading
+- [Qwen3.5-9B](https://huggingface.co/Qwen) — local orchestrator for search planning
+- [Devstral-24B](https://huggingface.co/mistralai) — local code agent for experiment proposals
 
 ## License
 
